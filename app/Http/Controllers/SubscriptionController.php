@@ -32,9 +32,13 @@ class SubscriptionController extends Controller
         }
 
         $formattedPlans = $plans->map(function ($plan) use ($offerEndsAt, $offerDiscount) {
-            // Dynamically calculate offer_price based on active discount percentage
-            $multiplier = (100 - $offerDiscount) / 100;
-            $offerPrice = round($plan->price * $multiplier, 2);
+            // Use explicitly set offer_price if available; otherwise auto-calculate from discount
+            if (!is_null($plan->offer_price) && $plan->offer_price > 0) {
+                $offerPrice = (float) $plan->offer_price;
+            } else {
+                $multiplier = (100 - $offerDiscount) / 100;
+                $offerPrice = round($plan->price * $multiplier, 2);
+            }
 
             return [
                 'id' => $plan->id,

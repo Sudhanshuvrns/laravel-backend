@@ -312,18 +312,77 @@ class AdminDashboardController extends Controller
         if ($serviceAccountSetting && !empty($serviceAccountSetting->value)) {
             try {
                 $serviceAccount = json_decode($serviceAccountSetting->value, true);
-                if (isset($serviceAccount['project_id'])) {
+                if (isset($serviceAccount['project_id'], $serviceAccount['private_key'], $serviceAccount['client_email'])) {
                     $projectId = $serviceAccount['project_id'];
-                    // Log & simulate dispatch
-                    \Illuminate\Support\Facades\Log::info("FCM Sent to project $projectId: Title: $title | Body: $body. Target Count: " . count($tokens));
+
+                    // Build JWT for Google OAuth2 token
+                    $now = time();
+                    $header = base64_encode(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+                    $payload = base64_encode(json_encode([
+                        'iss' => $serviceAccount['client_email'],
+                        'scope' => 'https://www.googleapis.com/auth/firebase.messaging',
+                        'aud' => 'https://oauth2.googleapis.com/token',
+                        'exp' => $now + 3600,
+                        'iat' => $now,
+                    ]));
+                    $signingInput = "$header.$payload";
+                    openssl_sign($signingInput, $signature, $serviceAccount['private_key'], OPENSSL_ALGO_SHA256);
+                    $jwt = "$signingInput." . base64_encode($signature);
+
+                    // Exchange JWT for access token
+                    $tokenResponse = \Illuminate\Support\Facades\Http::asForm()->post('https://oauth2.googleapis.com/token', [
+                        'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                        'assertion' => $jwt,
+                    ]);
+                    $accessToken = $tokenResponse->json('access_token');
+
+                    if (!$accessToken) {
+                        throw new \Exception('Failed to get FCM access token: ' . $tokenResponse->body());
+                    }
+
+                    // Send notification to each token
+                    $successCount = 0;
+                    $failCount = 0;
+                    foreach ($tokens as $token) {
+                        $fcmResponse = \Illuminate\Support\Facades\Http::withHeaders([
+                            'Authorization' => "Bearer $accessToken",
+                            'Content-Type' => 'application/json',
+                        ])->post("https://fcm.googleapis.com/v1/projects/$projectId/messages:send", [
+                            'message' => [
+                                'token' => $token,
+                                'notification' => [
+                                    'title' => $title,
+                                    'body' => $body,
+                                ],
+                                'android' => [
+                                    'priority' => 'high',
+                                    'notification' => ['sound' => 'default'],
+                                ],
+                                'apns' => [
+                                    'payload' => ['aps' => ['sound' => 'default']],
+                                ],
+                            ],
+                        ]);
+                        if ($fcmResponse->successful()) {
+                            $successCount++;
+                        } else {
+                            $failCount++;
+                            \Illuminate\Support\Facades\Log::warning("FCM failed for token: " . $fcmResponse->body());
+                        }
+                    }
+
                     return response()->json([
                         'status' => 'success',
-                        'message' => 'Push notifications sent successfully via Firebase (FCM v1 Engine).',
+                        'message' => "Push notifications sent! ($successCount success, $failCount failed)",
                         'tokens_count' => count($tokens),
                     ]);
                 }
             } catch (\Exception $e) {
                 \Illuminate\Support\Facades\Log::error("FCM Send Failure: " . $e->getMessage());
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'FCM dispatch failed: ' . $e->getMessage(),
+                ], 500);
             }
         }
 
